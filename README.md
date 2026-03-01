@@ -18,18 +18,30 @@ Software write blocker avec interface graphique PySide6 pour l'acquisition foren
 - Linux (teste sur Ubuntu)
 - Python 3.10+
 - Droits root (sudo)
+- `libxcb-cursor0` — dependance systeme requise par Qt/PySide6 pour le rendu des curseurs sous X11/XWayland
 
-## Installation
+## Lancement rapide
 
 ```bash
+./run.sh
+```
+
+Le script `run.sh` gere tout automatiquement :
+
+1. **Dependances systeme** — installe `libxcb-cursor0` si absent (via `apt-get`)
+2. **Environnement virtuel** — cree le venv `env` et installe les dependances Python si le dossier n'existe pas
+3. **Affichage** — force le mode X11 (`QT_QPA_PLATFORM=xcb`) pour que la fenetre ait des decorations (fermer, minimiser, maximiser) meme sous Wayland
+4. **Execution** — lance le programme en `sudo` avec les variables d'affichage necessaires
+
+## Installation manuelle
+
+Si vous preferez ne pas utiliser `run.sh` :
+
+```bash
+sudo apt-get install -y libxcb-cursor0
 python3 -m venv env
 source env/bin/activate
 pip install -r requirements.txt
-```
-
-## Utilisation
-
-```bash
 sudo ./env/bin/python write_blocker.py
 ```
 

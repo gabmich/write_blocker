@@ -4,6 +4,12 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_DIR="$SCRIPT_DIR/env"
 
+# Install system dependencies if missing
+if ! dpkg -s libxcb-cursor0 >/dev/null 2>&1; then
+    echo "[*] Installation de libxcb-cursor0..."
+    sudo apt-get install -y libxcb-cursor0
+fi
+
 # Create venv if it doesn't exist
 if [ ! -d "$VENV_DIR/bin" ]; then
     echo "[*] Creation du venv 'env'..."

@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Write Blocker - Software USB write blocker pour acquisition forensique."""
 
+import atexit
 import os
+import signal
 import subprocess
 import sys
+from pathlib import Path
 
 import pyudev
 from PySide6.QtCore import QObject, Qt, Signal, Slot
@@ -21,6 +24,109 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+
+UDEV_RULE_PATH = Path("/run/udev/rules.d/99-write-blocker.rules")
+UDEV_RULE_CONTENT = (
+    '# Installed by Write Blocker — removed on exit\n'
+    'ACTION=="add", SUBSYSTEM=="block", ENV{ID_BUS}=="usb", '
+    'RUN+="/sbin/blockdev --setro %N"\n'
+)
+
+# gsettings keys for GNOME automount
+_AUTOMOUNT_SCHEMA = "org.gnome.desktop.media-handling"
+_AUTOMOUNT_KEYS = ("automount", "automount-open")
+
+
+class SystemProtection:
+    """Install/remove system-level write-block protections (udev rule + automount)."""
+
+    def __init__(self):
+        self._udev_installed = False
+        self._automount_was_enabled: dict[str, bool] = {}
+
+    # --- public API ---
+
+    def install(self):
+        self._install_udev_rule()
+        self._disable_automount()
+
+    def remove(self):
+        self._remove_udev_rule()
+        self._restore_automount()
+
+    # --- udev rule ---
+
+    def _install_udev_rule(self):
+        try:
+            UDEV_RULE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            UDEV_RULE_PATH.write_text(UDEV_RULE_CONTENT)
+            subprocess.run(
+                ["udevadm", "control", "--reload-rules"],
+                check=True, capture_output=True,
+            )
+            self._udev_installed = True
+        except (OSError, subprocess.CalledProcessError) as e:
+            print(f"WARN: impossible d'installer la regle udev: {e}", file=sys.stderr)
+
+    def _remove_udev_rule(self):
+        if not self._udev_installed:
+            return
+        try:
+            UDEV_RULE_PATH.unlink(missing_ok=True)
+            subprocess.run(
+                ["udevadm", "control", "--reload-rules"],
+                check=True, capture_output=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as e:
+            print(f"WARN: impossible de retirer la regle udev: {e}", file=sys.stderr)
+        self._udev_installed = False
+
+    # --- GNOME automount ---
+
+    def _gsettings_cmd(self, args: list[str]) -> subprocess.CompletedProcess:
+        """Run gsettings as the real (non-root) user so it reaches the session dbus."""
+        real_user = os.environ.get("SUDO_USER")
+        if real_user:
+            import pwd
+            uid = pwd.getpwnam(real_user).pw_uid
+            cmd = ["sudo", "-u", real_user, "env",
+                   f"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{uid}/bus",
+                   "gsettings"] + args
+        else:
+            cmd = ["gsettings"] + args
+        return subprocess.run(cmd, capture_output=True, text=True)
+
+    def _gsettings_get(self, key: str) -> bool | None:
+        try:
+            ret = self._gsettings_cmd(["get", _AUTOMOUNT_SCHEMA, key])
+            if ret.returncode != 0:
+                return None
+            return ret.stdout.strip() == "true"
+        except (FileNotFoundError, KeyError):
+            return None
+
+    def _gsettings_set(self, key: str, value: bool):
+        try:
+            self._gsettings_cmd(["set", _AUTOMOUNT_SCHEMA, key,
+                                 "true" if value else "false"])
+        except (FileNotFoundError, KeyError):
+            pass
+
+    def _disable_automount(self):
+        for key in _AUTOMOUNT_KEYS:
+            current = self._gsettings_get(key)
+            if current is None:
+                continue  # gsettings not available or schema not found
+            self._automount_was_enabled[key] = current
+            if current:
+                self._gsettings_set(key, False)
+
+    def _restore_automount(self):
+        for key, was_enabled in self._automount_was_enabled.items():
+            if was_enabled:
+                self._gsettings_set(key, True)
+        self._automount_was_enabled.clear()
 
 
 def has_media(device_path: str) -> bool:
@@ -126,11 +232,22 @@ def set_device_ro(device_path: str) -> tuple[bool, str]:
 
 
 def set_device_rw(device_path: str) -> tuple[bool, str]:
-    """Set device and all its partitions to read-write.
+    """Unmount, set device and all partitions to read-write, then remount.
     Returns (success, error_message)."""
     try:
+        # Wait for all pending udev events (partition creation + our RO rule)
+        subprocess.run(["udevadm", "settle", "--timeout=5"],
+                       capture_output=True)
+
+        # 1) Unmount everything first (a mount started as RO stays RO
+        #    even after blockdev --setrw, so we must remount from scratch)
+        ok, err = unmount_device(device_path)
+        # (unmount may fail if nothing was mounted — that's fine)
+
+        # 2) Set RW on disk + all partitions
         subprocess.check_call(["blockdev", "--setrw", device_path],
                               stderr=subprocess.DEVNULL)
+
         partitions = subprocess.check_output(
             ["lsblk", "-lnpo", "NAME", device_path],
             text=True, stderr=subprocess.DEVNULL,
@@ -140,9 +257,89 @@ def set_device_rw(device_path: str) -> tuple[bool, str]:
             if part and part != device_path:
                 subprocess.check_call(["blockdev", "--setrw", part],
                                       stderr=subprocess.DEVNULL)
+
+        # 3) Mount partitions fresh as RW
+        _mount_partitions(device_path)
         return True, ""
     except subprocess.CalledProcessError as e:
         return False, str(e)
+
+
+def _mount_partitions(device_path: str):
+    """Mount all unmounted partitions of a device."""
+    import json
+    import pwd
+
+    # Determine real user uid/gid for mount ownership
+    real_user = os.environ.get("SUDO_USER", "")
+    if real_user:
+        pw = pwd.getpwnam(real_user)
+        uid, gid = pw.pw_uid, pw.pw_gid
+    else:
+        uid, gid = os.getuid(), os.getgid()
+
+    try:
+        output = subprocess.check_output(
+            ["lsblk", "-Jlnpo", "NAME,FSTYPE,MOUNTPOINT,LABEL", device_path],
+            text=True, stderr=subprocess.DEVNULL,
+        )
+        data = json.loads(output)
+    except (subprocess.CalledProcessError, ValueError):
+        return
+
+    for dev in data.get("blockdevices", []):
+        part_name = dev.get("name", "")
+        fstype = dev.get("fstype") or ""
+        mountpoint = dev.get("mountpoint") or ""
+        label = dev.get("label") or ""
+        # Skip the raw disk and already-mounted partitions
+        if part_name == device_path or mountpoint:
+            continue
+
+        # If lsblk didn't detect fstype, try blkid
+        if not fstype:
+            try:
+                blkid_out = subprocess.check_output(
+                    ["blkid", "-o", "value", "-s", "TYPE", part_name],
+                    text=True, stderr=subprocess.DEVNULL,
+                ).strip()
+                if blkid_out:
+                    fstype = blkid_out
+            except subprocess.CalledProcessError:
+                pass
+
+        if not fstype:
+            continue
+
+        # Get label from blkid if lsblk didn't provide one
+        if not label:
+            try:
+                label = subprocess.check_output(
+                    ["blkid", "-o", "value", "-s", "LABEL", part_name],
+                    text=True, stderr=subprocess.DEVNULL,
+                ).strip()
+            except subprocess.CalledProcessError:
+                pass
+
+        # Build a mount point under /media/<user>/<label_or_device_name>
+        mount_name = label if label else os.path.basename(part_name)
+        mount_dir = f"/media/{real_user or 'root'}/{mount_name}"
+        os.makedirs(mount_dir, exist_ok=True)
+
+        # FAT/exFAT/NTFS need uid/gid options for user-level write access
+        _FS_NEEDS_UID = ("vfat", "fat32", "fat16", "exfat", "ntfs", "ntfs3")
+        if fstype in _FS_NEEDS_UID:
+            mount_opts = f"rw,uid={uid},gid={gid},dmask=0022,fmask=0133"
+        else:
+            mount_opts = "rw"
+
+        ret = subprocess.run(
+            ["mount", "-t", fstype, "-o", mount_opts, part_name, mount_dir],
+            capture_output=True, text=True,
+        )
+        # For native Linux fs (ext4, xfs...), chown the root of the mount
+        if ret.returncode == 0 and fstype not in _FS_NEEDS_UID:
+            os.chown(mount_dir, uid, gid)
 
 
 class UdevSignal(QObject):
@@ -153,11 +350,12 @@ class UdevSignal(QObject):
 
 
 class WriteBlockerWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, protection: SystemProtection):
         super().__init__()
         self.setWindowTitle("Write Blocker - Forensic USB Controller")
         self.setMinimumSize(800, 400)
         self.devices: dict[str, dict] = {}  # device_path -> info dict
+        self._protection = protection
 
         self._build_ui()
         self._start_udev_monitor()
@@ -383,6 +581,7 @@ class WriteBlockerWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.observer.stop()
+        self._protection.remove()
         event.accept()
 
 
@@ -395,9 +594,18 @@ def main():
         )
         sys.exit(1)
 
+    # Install system-level protections (udev rule + disable automount)
+    protection = SystemProtection()
+    protection.install()
+
+    # Safety net: remove protections on crash / SIGTERM / SIGINT
+    atexit.register(protection.remove)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: sys.exit(0))
+
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    window = WriteBlockerWindow()
+    window = WriteBlockerWindow(protection)
     window.show()
     sys.exit(app.exec())
 

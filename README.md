@@ -1,41 +1,77 @@
 # Write Blocker
 
-Software write blocker avec interface graphique PySide6 pour l'acquisition forensique sous Linux.
+Software USB write blocker with a PySide6 GUI for forensic acquisition on Linux.
 
-> **Description courte :** Write Blocker est un bloqueur d'ecriture logiciel sous Linux avec GUI PySide6. Il detecte automatiquement les disques USB connectes, les verrouille en lecture seule et permet de choisir quels disques autoriser en ecriture. Ideal pour preparer une acquisition forensique avec Guymager.
+> **TL;DR:** Write Blocker automatically detects USB drives, locks them read-only at the kernel level, and lets you choose which drives to unlock for writing. Designed to prepare forensic acquisitions with tools like Guymager.
 
-## Fonctionnalites
+## Features
 
-- **Detection automatique** des disques USB via udev (branchement a chaud)
-- **Politique par defaut : lecture seule** — tout nouveau disque est immediatement demonte et verrouille
-- **Bascule RO/RW** par disque avec confirmation obligatoire avant tout passage en ecriture
-- **Demontage automatique** des partitions avant verrouillage (empeche les ecritures sur un mount existant)
-- **Protection complete** : disque + toutes ses partitions (blockdev --setro)
-- **Tableau de bord** : device, modele, vendor, taille, numero de serie, statut
+- **Automatic USB detection** via udev (hot-plug support)
+- **Default policy: read-only** — every new USB drive is immediately unmounted and write-blocked
+- **Kernel-level udev rule** — a temporary udev rule (`/run/udev/rules.d/`) forces `blockdev --setro` on USB devices *before* any desktop automount can occur, eliminating the RW window
+- **GNOME automount disabled** at startup (restored on exit) to prevent the desktop from remounting devices behind the blocker's back
+- **RO/RW toggle** per drive with mandatory confirmation before enabling writes
+- **Proper remount on RW switch** — partitions are unmounted, set RW, and remounted with correct user ownership (`uid`/`gid`)
+- **Full protection** — both the raw disk and all its partitions are covered (`blockdev --setro`)
+- **Dashboard** — device path, model, vendor, size, serial number, and status at a glance
+- **Clean teardown** — udev rule removed and automount restored on exit, `atexit` + signal handlers as safety net; rule lives in `/run/` so it vanishes on reboot even after a hard crash
 
-## Prerequis
+## How it works
 
-- Linux (teste sur Ubuntu)
+### On startup
+
+1. A temporary udev rule is installed in `/run/udev/rules.d/99-write-blocker.rules` — it tells the kernel to run `blockdev --setro` on every USB block device as soon as it appears, **before** any desktop environment can automount it
+2. GNOME automount is disabled via `gsettings` (if available)
+3. Already-connected USB drives are scanned and displayed
+
+### When a USB drive is plugged in
+
+1. The udev rule fires immediately → `blockdev --setro` on the raw device and partitions at kernel level
+2. The pyudev monitor detects the drive → the app unmounts any leftover mounts and confirms the RO flag
+3. A popup asks whether the drive is the **source** (evidence, keep RO) or **target** (destination, switch to RW)
+
+### Switching to RW (target drive)
+
+1. All partitions are **unmounted** (a mount started as RO stays RO even after `blockdev --setrw`, so a fresh remount is required)
+2. `blockdev --setrw` is applied to the disk and all partitions
+3. Partitions are **mounted fresh** under `/media/<user>/` with the real user's `uid`/`gid` so the file manager can read and write normally
+
+### Switching to RO (evidence drive)
+
+1. All partitions are **unmounted**
+2. `blockdev --setro` is applied to the disk and all partitions
+3. Nothing is remounted — the drive is fully protected
+
+### On exit
+
+1. The udev rule is removed and `udevadm control --reload-rules` is called
+2. GNOME automount is restored to its previous state
+
+> **Note:** This is a software write blocker — it protects against accidental software writes, which is sufficient for standard forensic acquisitions. It is not a hardware write blocker.
+
+## Requirements
+
+- Linux (tested on Ubuntu)
 - Python 3.10+
-- Droits root (sudo)
-- `libxcb-cursor0` — dependance systeme requise par Qt/PySide6 pour le rendu des curseurs sous X11/XWayland
+- Root privileges (sudo)
+- `libxcb-cursor0` — system dependency required by Qt/PySide6 for cursor rendering under X11/XWayland
 
-## Lancement rapide
+## Quick start
 
 ```bash
 ./run.sh
 ```
 
-Le script `run.sh` gere tout automatiquement :
+The `run.sh` script handles everything automatically:
 
-1. **Dependances systeme** — installe `libxcb-cursor0` si absent (via `apt-get`)
-2. **Environnement virtuel** — cree le venv `env` et installe les dependances Python si le dossier n'existe pas
-3. **Affichage** — force le mode X11 (`QT_QPA_PLATFORM=xcb`) pour que la fenetre ait des decorations (fermer, minimiser, maximiser) meme sous Wayland
-4. **Execution** — lance le programme en `sudo` avec les variables d'affichage necessaires
+1. **System dependencies** — installs `libxcb-cursor0` if missing (via `apt-get`)
+2. **Virtual environment** — creates the `env` venv and installs Python dependencies if the directory doesn't exist
+3. **Display** — forces X11 mode (`QT_QPA_PLATFORM=xcb`) so the window gets proper decorations (close, minimize, maximize) even under Wayland
+4. **Execution** — runs the program as `sudo` with the necessary display and D-Bus environment variables
 
-## Installation manuelle
+## Manual installation
 
-Si vous preferez ne pas utiliser `run.sh` :
+If you prefer not to use `run.sh`:
 
 ```bash
 sudo apt-get install -y libxcb-cursor0
@@ -45,25 +81,14 @@ pip install -r requirements.txt
 sudo ./env/bin/python write_blocker.py
 ```
 
-### Workflow forensique typique
+## Typical forensic workflow
 
-1. Lancer le write blocker
-2. Brancher le disque **source** (evidence) → le laisser en **READ-ONLY** (defaut)
-3. Brancher le disque **cible** (destination) → choisir **READ-WRITE** dans la popup
-4. Lancer **Guymager** pour l'acquisition
-5. Debrancher les disques
+1. Launch the write blocker
+2. Plug in the **source** drive (evidence) → keep it in **READ-ONLY** (default)
+3. Plug in the **target** drive (destination) → choose **READ-WRITE** in the popup
+4. Launch **Guymager** (or any acquisition tool) to image the source onto the target
+5. Unplug the drives
 
-## Fonctionnement technique
-
-Le write-blocking repose sur `blockdev --setro` au niveau kernel :
-
-1. Un disque USB est detecte via **pyudev**
-2. Toutes ses partitions sont **demontees** (`umount`)
-3. Le flag read-only est applique sur le disque et ses partitions (`blockdev --setro`)
-4. Toute tentative de mount RW est refusee par le kernel
-
-Ce n'est pas un bloqueur materiel — il protege contre les ecritures accidentelles logicielles, ce qui est suffisant pour une acquisition forensique standard.
-
-## Licence
+## License
 
 MIT

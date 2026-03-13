@@ -26,5 +26,8 @@ xhost +si:localuser:root 2>/dev/null || true
 
 # Run as root via XWayland (force X11) so the window manager decorates the window
 echo "[*] Lancement de write_blocker en sudo..."
-sudo DISPLAY="$DISPLAY" XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" QT_QPA_PLATFORM=xcb \
+sudo DISPLAY="$DISPLAY" \
+    XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
+    QT_QPA_PLATFORM=xcb \
+    DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}" \
     "$VENV_DIR/bin/python" "$SCRIPT_DIR/write_blocker.py"
